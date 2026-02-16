@@ -2,6 +2,7 @@
 import argparse
 import json
 import re
+import heapq
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
 
@@ -23,16 +24,16 @@ def topological_sort(nodes: Dict[str, Dict], include_keys: Set[str]) -> List[str
             outgoing[d].add(unique_id)
 
     ready = [k for k, v in incoming.items() if not v]
+    heapq.heapify(ready)
     order = []
 
     while ready:
-        n = ready.pop()
+        n = heapq.heappop(ready)
         order.append(n)
-        for m in list(outgoing[n]):
+        for m in outgoing.get(n, set()):
             incoming[m].discard(n)
-            outgoing[n].discard(m)
             if not incoming[m]:
-                ready.append(m)
+                heapq.heappush(ready, m)
 
     if len(order) != len(include_keys):
         remaining = [k for k in include_keys if k not in order]
@@ -65,10 +66,11 @@ def compute_levels(nodes: Dict[str, Dict], include_keys: Set[str]) -> Dict[str, 
     return levels
 
 
-def resolve_compiled_path(compiled_dir: Path, node: Dict) -> Path:
+def resolve_compiled_path(compiled_dir: Path, node: Dict, project_dir: Path) -> Path:
     compiled_path = node.get("compiled_path")
     if compiled_path:
-        return Path(compiled_path)
+        compiled = Path(compiled_path)
+        return compiled if compiled.is_absolute() else project_dir / compiled
 
     original_file_path = node.get("original_file_path")
     if not original_file_path:
@@ -89,23 +91,15 @@ def should_include(node: Dict, include_disabled: bool, resource_types: Set[str])
 
 def strip_catalog_qualifiers(sql: str) -> str:
     # Replace three-part identifiers with two-part (schema.table)
-    # Unquoted identifiers
     ident = r"[A-Za-z_][\w$]*"
     sql = re.sub(rf"\b({ident})\.({ident})\.({ident})\b", r"\2.\3", sql)
-
-    # Double-quoted identifiers
     sql = re.sub(r'"([^"]+)"\."([^"]+)"\."([^"]+)"', r'"\2"."\3"', sql)
-
-    # Backtick identifiers
     sql = re.sub(r"`([^`]+)`\.`([^`]+)`\.`([^`]+)`", r"`\2`.`\3`", sql)
-
-    # Bracket identifiers
     sql = re.sub(r"\[([^\]]+)\]\.\[([^\]]+)\]\.\[([^\]]+)\]", r"[\2].[\3]", sql)
-
     return sql
 
 
-def resolve_output_paths(out_path: Path, max_level: int) -> Tuple[Path, str]:
+def resolve_output_paths(out_path: Path) -> Tuple[Path, str]:
     if out_path.suffix:
         out_dir = out_path.parent
         base_name = out_path.name
@@ -115,6 +109,46 @@ def resolve_output_paths(out_path: Path, max_level: int) -> Tuple[Path, str]:
 
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir, base_name
+
+
+def write_sequence_file(
+    out_file: Path,
+    project_dir: Path,
+    env: str | None,
+    sequence: int,
+    total_sequences: int,
+    nodes: Dict[str, Dict],
+    compiled_dir: Path,
+    project_dir_for_compiled: Path,
+    node_ids: List[str],
+) -> None:
+    with out_file.open("w", encoding="utf-8") as out:
+        out.write("-- DBT SQL Compiler\n")
+        out.write(f"-- Project: {project_dir}\n")
+        if env:
+            out.write(f"-- Environment: {env}\n")
+        out.write(f"-- Sequence: {sequence:02d} of {total_sequences:02d}\n")
+        out.write(f"-- Models: {len(node_ids)}\n\n")
+
+        for unique_id in node_ids:
+            node = nodes[unique_id]
+            name = node.get("name")
+            resource_type = node.get("resource_type")
+            compiled_path = resolve_compiled_path(compiled_dir, node, project_dir_for_compiled)
+
+            if not compiled_path.exists():
+                out.write(f"-- WARNING: missing compiled file for {unique_id} at {compiled_path}\n\n")
+                continue
+
+            sql = read_sql(compiled_path)
+            sql = strip_catalog_qualifiers(sql)
+
+            out.write("-- =========================================\n")
+            out.write(f"-- {resource_type}: {name}\n")
+            out.write(f"-- unique_id: {unique_id}\n")
+            out.write("-- =========================================\n\n")
+            out.write(sql)
+            out.write("\n\n")
 
 
 def main():
@@ -151,14 +185,29 @@ def main():
         if should_include(v, args.include_disabled, resource_types)
     }
 
+    out_path = Path(args.out).resolve()
+    out_dir, base_name = resolve_output_paths(out_path)
+
+    if not include_keys:
+        out_file = out_dir / f"01-{base_name}"
+        write_sequence_file(
+            out_file,
+            project_dir,
+            args.env,
+            1,
+            1,
+            nodes,
+            compiled_dir,
+            project_dir,
+            [],
+        )
+        print(f"Wrote {out_file}")
+        return
+
     order = topological_sort(nodes, include_keys)
     levels = compute_levels(nodes, include_keys)
-    max_level = max(levels.values(), default=0)
+    max_level = max(levels.values(), default=1)
 
-    out_path = Path(args.out).resolve()
-    out_dir, base_name = resolve_output_paths(out_path, max_level)
-
-    # Group by level, preserving topological order within each level
     level_to_nodes: Dict[int, List[str]] = {lvl: [] for lvl in range(1, max_level + 1)}
     for unique_id in order:
         lvl = levels.get(unique_id, 1)
@@ -168,33 +217,17 @@ def main():
         file_name = f"{lvl:02d}-{base_name}"
         out_file = out_dir / file_name
 
-        with out_file.open("w", encoding="utf-8") as out:
-            out.write("-- DBT SQL Compiler\n")
-            out.write(f"-- Project: {project_dir}\n")
-            if args.env:
-                out.write(f"-- Environment: {args.env}\n")
-            out.write(f"-- Sequence: {lvl:02d} of {max_level:02d}\n")
-            out.write(f"-- Models: {len(level_to_nodes.get(lvl, []))}\n\n")
-
-            for unique_id in level_to_nodes.get(lvl, []):
-                node = nodes[unique_id]
-                name = node.get("name")
-                resource_type = node.get("resource_type")
-                compiled_path = resolve_compiled_path(compiled_dir, node)
-
-                if not compiled_path.exists():
-                    out.write(f"-- WARNING: missing compiled file for {unique_id} at {compiled_path}\n\n")
-                    continue
-
-                sql = read_sql(compiled_path)
-                sql = strip_catalog_qualifiers(sql)
-
-                out.write("-- =========================================\n")
-                out.write(f"-- {resource_type}: {name}\n")
-                out.write(f"-- unique_id: {unique_id}\n")
-                out.write("-- =========================================\n\n")
-                out.write(sql)
-                out.write("\n\n")
+        write_sequence_file(
+            out_file,
+            project_dir,
+            args.env,
+            lvl,
+            max_level,
+            nodes,
+            compiled_dir,
+            project_dir,
+            level_to_nodes.get(lvl, []),
+        )
 
         print(f"Wrote {out_file}")
 
